@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Roteirizador de Entregas Avançado</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        body {
+            font-family: 'Roboto', Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            -webkit-tap-highlight-color: transparent;
+        }
+        #map {
+            height: 50vh;
+            width: 100%;
+            z-index: 1;
+        }
+        #order-list {
+            margin: 15px;
+            max-height: 30vh;
+            overflow-y: auto;
+        }
+        form, #screenshot-container, #route-options {
+            margin: 15px;
+        }
+        input[type="text"], button, input[type="file"], select {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            box-sizing: border-box;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        #order-list p {
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 4px;
+            margin: 5px 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        #order-list button {
+            background-color: #f44336;
+            padding: 8px 12px;
+            font-size: 14px;
+        }
+        .loading {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: 1.5em;
+        }
+        .loading.active {
+            display: flex;
+        }
+        .location-warning {
+            background-color: #fff3cd;
+            color: #856404;
+            padding: 15px;
+            margin: 15px;
+            border-radius: 4px;
+            border-left: 6px solid #ffeeba;
+        }
+        .location-warning a {
+            color: #0056b3;
+            text-decoration: underline;
+        }
+        #local-file-warning {
+            display: none;
+        }
+        .route-option {
+            margin-bottom: 15px;
+        }
+        .route-option label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        @media (max-width: 600px) {
+            #map {
+                height: 60vh;
+            }
+            #order-list {
+                max-height: 20vh;
+            }
+        }
+    </style>
+</head>
+<body>
+    <h1 style="margin: 15px; font-size: 1.5em;">Roteirizador de Entregas Avançado</h1>
+    
+    <div id="location-warning" class="location-warning" style="display:none;">
+        <strong>Atenção:</strong> <span id="warning-message"></span>
+        <span id="local-file-warning">
+            <a href="#" id="try-anyway-link">Tentar métodos alternativos</a>
+        </span>
+    </div>
+    
+    <form id="order-form">
+        <input type="text" id="address" placeholder="Digite o endereço" required>
+        <button type="submit" id="submit-btn">Adicionar Manualmente</button>
+    </form>
+    <div id="screenshot-container">
+        <label>Ou envie uma captura de tela:</label>
+        <input type="file" id="screenshot" accept="image/*" capture="environment">
+    </div>
+    <div id="route-options">
+        <div class="route-option">
+            <label for="sort-method">Método de Ordenação:</label>
+            <select id="sort-method">
+                <option value="optimized">Otimizado (mais próximo primeiro)</option>
+                <option value="original">Ordem de inclusão</option>
+                <option value="reverse">Ordem inversa</option>
+            </select>
+        </div>
+        <button id="update-route-btn">Atualizar Rota</button>
+    </div>
+    <div id="order-list"></div>
+    <div id="map"></div>
+    <div id="loading" class="loading">Processando...</div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/tesseract.js@4.1.1/dist/tesseract.min.js"></script>
+    <script>
+        // Configurações
+        const GEOLOCATION_TIMEOUT = 10000;
+        const LAST_LOCATION_CACHE_KEY = 'lastKnownLocation';
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY = 2000;
+        const OSRM_TIMEOUT = 30000; // 30 segundos para roteirização
+
+        // Elementos do DOM
+        const loadingElement = document.getElementById('loading');
+        const submitBtn = document.getElementById('submit-btn');
+        const locationWarning = document.getElementById('location-warning');
+        const warningMessage = document.getElementById('warning-message');
+        const localFileWarning = document.getElementById('local-file-warning');
+        const tryAnywayLink = document.getElementById('try-anyway-link');
+        const sortMethodSelect = document.getElementById('sort-method');
+        const updateRouteBtn = document.getElementById('update-route-btn');
+
+        // Inicializar mapa
+        let map;
+        let currentLocationMarker = null;
+        try {
+            map = L.map('map').setView([-23.5505, -46.6333], 13);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap',
+                maxZoom: 18
+            }).addTo(map);
+        } catch (error) {
+            console.error('Erro ao carregar mapa:', error);
+            showError('Erro ao carregar o mapa. Verifique sua conexão.');
+        }
+
+        // Lista de pedidos
+        let orders = [];
+        let originalOrder = []; // Mantém a ordem original de inclusão
+        try {
+            const savedOrders = JSON.parse(localStorage.getItem('orders')) || [];
+            orders = savedOrders;
+            originalOrder = [...savedOrders];
+        } catch (error) {
+            console.error('Erro ao acessar localStorage:', error);
+            showError('Erro ao carregar pedidos salvos.');
+        }
+
+        // Funções utilitárias
+        function showError(message) {
+            alert(message);
+            warningMessage.textContent = message;
+            locationWarning.style.display = 'block';
+        }
+
+        function delay(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        function isRunningLocally() {
+            return window.location.protocol === 'file:';
+        }
+
+        function isSecureContext() {
+            return window.isSecureContext;
+        }
+
+        // Funções de geolocalização
+        async function getLocationByIP(retryCount = 0) {
+            try {
+                const response = await fetch('https://ipapi.co/json/');
+                if (!response.ok) throw new Error('Falha na requisição IP');
+                const data = await response.json();
+                
+                if (data.latitude && data.longitude) {
+                    return {
+                        latitude: parseFloat(data.latitude),
+                        longitude: parseFloat(data.longitude),
+                        accuracy: 5000,
+                        source: 'IP'
+                    };
+                }
+                throw new Error('Dados de localização inválidos');
+            } catch (error) {
+                if (retryCount < MAX_RETRIES) {
+                    await delay(RETRY_DELAY);
+                    return getLocationByIP(retryCount + 1);
+                }
+                console.error('Erro na geolocalização por IP:', error);
+                return null;
+            }
+        }
+
+        async function getLocationByFreeGeoIP(retryCount = 0) {
+            try {
+                const response = await fetch('https://freegeoip.app/json/');
+                if (!response.ok) throw new Error('Falha na requisição FreeGeoIP');
+                const data = await response.json();
+                
+                if (data.latitude && data.longitude) {
+                    return {
+                        latitude: parseFloat(data.latitude),
+                        longitude: parseFloat(data.longitude),
+                        accuracy: 5000,
+                        source: 'FreeGeoIP'
+                    };
+                }
+                throw new Error('Dados de localização inválidos');
+            } catch (error) {
+                if (retryCount < MAX_RETRIES) {
+                    await delay(RETRY_DELAY);
+                    return getLocationByFreeGeoIP(retryCount + 1);
+                }
+                console.error('Erro na geolocalização por FreeGeoIP:', error);
+                return null;
+            }
+        }
+
+        function getLastKnownLocation() {
+            try {
+                const lastLocation = localStorage.getItem(LAST_LOCATION_CACHE_KEY);
+                if (lastLocation) {
+                    const { latitude, longitude, timestamp } = JSON.parse(lastLocation);
+                    if (Date.now() - timestamp < 3600000) {
+                        return {
+                            latitude,
+                            longitude,
+                            accuracy: 1000,
+                            source: 'Cache'
+                        };
+                    }
+                }
+            } catch (error) {
+                console.error('Erro ao acessar cache:', error);
+            }
+            return null;
+        }
+
+        function saveLastKnownLocation(latitude, longitude) {
+            try {
+                localStorage.setItem(LAST_LOCATION_CACHE_KEY, JSON.stringify({
+                    latitude,
+                    longitude,
+                    timestamp: Date.now()
+                }));
+            } catch (error) {
+                console.error('Erro ao salvar cache:', error);
+            }
+        }
+
+        async function getCurrentLocationWithFallback() {
+            const attempts = [];
+
+            // 1. Tentar Geolocalização do navegador
+            if (navigator.geolocation && isSecureContext()) {
+                try {
+                    const position = await new Promise((resolve, reject) => {
+                        navigator.geolocation.getCurrentPosition(
+                            resolve,
+                            reject,
+                            {
+                                enableHighAccuracy: true,
+                                timeout: GEOLOCATION_TIMEOUT,
+                                maximumAge: 0
+                            }
+                        );
+                    });
+                    
+                    const { latitude, longitude, accuracy } = position.coords;
+                    saveLastKnownLocation(latitude, longitude);
+                    return { latitude, longitude, accuracy, source: 'GPS' };
+                } catch (error) {
+                    attempts.push({ method: 'GPS', error });
+                    console.log('Geolocalização GPS falhou:', error);
+                }
+            }
+
+            // 2. Tentar cache
+            const cachedLocation = getLastKnownLocation();
+            if (cachedLocation) {
+                return cachedLocation;
+            }
+
+            // 3. Tentar IP-based geolocation services
+            const ipLocation = await getLocationByIP();
+            if (ipLocation) {
+                saveLastKnownLocation(ipLocation.latitude, ipLocation.longitude);
+                return ipLocation;
+            }
+            attempts.push({ method: 'IP', error: 'Falha na localização por IP' });
+
+            // 4. Tentar FreeGeoIP
+            const freeGeoLocation = await getLocationByFreeGeoIP();
+            if (freeGeoLocation) {
+                saveLastKnownLocation(freeGeoLocation.latitude, freeGeoLocation.longitude);
+                return freeGeoLocation;
+            }
+            attempts.push({ method: 'FreeGeoIP', error: 'Falha na localização por FreeGeoIP' });
+
+            // 5. Fallback para localização padrão
+            attempts.push({ method: 'Default', error: 'Usando localização padrão' });
+            return {
+                latitude: -23.5505,
+                longitude: -46.6333,
+                accuracy: 10000,
+                source: 'Default'
+            };
+        }
+
+        function showLocationOnMap(latitude, longitude, accuracy, source) {
+            try {
+                // Remove o marcador anterior se existir
+                if (currentLocationMarker) {
+                    map.removeLayer(currentLocationMarker);
+                }
+
+                currentLocationMarker = L.marker([latitude, longitude], {
+                    icon: L.divIcon({
+                        className: 'current-location-marker',
+                        html: '📍',
+                        iconSize: [30, 30]
+                    })
+                }).addTo(map).bindPopup(`Você está aqui (${source})`);
+
+                if (accuracy && source !== 'Default') {
+                    L.circle([latitude, longitude], {
+                        color: 'blue',
+                        fillColor: '#30f',
+                        fillOpacity: 0.2,
+                        radius: accuracy
+                    }).addTo(map);
+                }
+
+                map.setView([latitude, longitude], 13);
+                return currentLocationMarker;
+            } catch (error) {
+                console.error('Erro ao mostrar localização no mapa:', error);
+                showError('Erro ao exibir localização no mapa.');
+                return null;
+            }
+        }
+
+        function checkLocationPermissions() {
+            if (isRunningLocally()) {
+                warningMessage.textContent = 'Execute em HTTPS para melhor precisão.';
+                locationWarning.style.display = 'block';
+                localFileWarning.style.display = 'inline';
+            } else if (!isSecureContext()) {
+                warningMessage.textContent = 'HTTPS necessário para melhor precisão.';
+                locationWarning.style.display = 'block';
+                localFileWarning.style.display = 'none';
+            } else {
+                locationWarning.style.display = 'none';
+            }
+        }
+
+        tryAnywayLink.addEventListener('click', async function(e) {
+            e.preventDefault();
+            locationWarning.style.display = 'none';
+            loadingElement.textContent = 'Buscando localização...';
+            loadingElement.classList.add('active');
+
+            try {
+                const location = await getCurrentLocationWithFallback();
+                showLocationOnMap(location.latitude, location.longitude, location.accuracy, location.source);
+
+                if (location.source !== 'GPS') {
+                    showError(`Localização via ${location.source}. Precisão pode ser menor.`);
+                }
+            } catch (error) {
+                console.error('Erro ao obter localização:', error);
+                showError('Falha ao determinar localização. Usando padrão.');
+                showLocationOnMap(-23.5505, -46.6333, 10000, 'Default');
+            } finally {
+                loadingElement.classList.remove('active');
+            }
+        });
+
+        // Funções de pedidos
+        function renderOrders() {
+            try {
+                const orderList = document.getElementById('order-list');
+                if (!orderList) return;
+
+                orderList.innerHTML = '<h2>Pedidos</h2>';
+                if (orders.length === 0) {
+                    orderList.innerHTML += '<p>Nenhum pedido adicionado.</p>';
+                    return;
+                }
+
+                orders.forEach((order, index) => {
+                    const orderElement = document.createElement('p');
+                    orderElement.innerHTML = `
+                        <span>${order.address}</span>
+                        <button onclick="removeOrder(${index})">Remover</button>
+                    `;
+                    orderList.appendChild(orderElement);
+                });
+            } catch (error) {
+                console.error('Erro ao renderizar pedidos:', error);
+                showError('Erro ao exibir lista de pedidos.');
+            }
+        }
+
+        document.getElementById('order-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const addressInput = document.getElementById('address');
+            const address = addressInput.value.trim();
+
+            if (!address) {
+                showError('Digite um endereço válido.');
+                return;
+            }
+
+            try {
+                submitBtn.disabled = true;
+                loadingElement.classList.add('active');
+                await addOrder(address);
+                addressInput.value = '';
+            } catch (error) {
+                console.error('Erro ao adicionar pedido:', error);
+                showError('Erro ao adicionar pedido. Tente novamente.');
+            } finally {
+                submitBtn.disabled = false;
+                loadingElement.classList.remove('active');
+            }
+        });
+
+        document.getElementById('screenshot').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            try {
+                loadingElement.classList.add('active');
+                const result = await Tesseract.recognize(URL.createObjectURL(file), 'por');
+                const text = result.data.text;
+
+                const addressMatch = text.match(/(Rua|Avenida|Av\.|Travessa|Alameda|Praça|Rodovia|Estrada) .*?\d+[^\n]*/i);
+                if (addressMatch) {
+                    const address = addressMatch[0].trim();
+                    if (confirm(`Endereço encontrado: ${address}\n\nConfirmar?`)) {
+                        await addOrder(address);
+                    }
+                } else {
+                    showError('Endereço não encontrado na imagem.');
+                }
+            } catch (error) {
+                console.error('Erro ao processar imagem:', error);
+                showError('Erro ao processar imagem. Tente novamente.');
+            } finally {
+                e.target.value = '';
+                loadingElement.classList.remove('active');
+            }
+        });
+
+        updateRouteBtn.addEventListener('click', async () => {
+            try {
+                loadingElement.classList.add('active');
+                await updateRoute();
+            } catch (error) {
+                console.error('Erro ao atualizar rota:', error);
+                showError('Erro ao atualizar rota. Tente novamente.');
+            } finally {
+                loadingElement.classList.remove('active');
+            }
+        });
+
+        async function addOrder(address) {
+            try {
+                loadingElement.textContent = 'Buscando coordenadas...';
+                loadingElement.classList.add('active');
+
+                // Verifica se o endereço já existe (ignorando maiúsculas/minúsculas)
+                const normalizedAddress = address.toLowerCase().trim();
+                if (orders.some(order => order.address.toLowerCase().trim() === normalizedAddress)) {
+                    showError('Endereço já adicionado.');
+                    return;
+                }
+
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 10000);
+
+                const response = await fetch(
+                    `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1`,
+                    { signal: controller.signal }
+                );
+
+                clearTimeout(timeout);
+
+                if (!response.ok) throw new Error('Erro na requisição Nominatim');
+                
+                const data = await response.json();
+                if (data.length === 0) throw new Error('Endereço não encontrado');
+
+                const { lat, lon, display_name } = data[0];
+                const newOrder = {
+                    address: display_name || address,
+                    lat: parseFloat(lat),
+                    lon: parseFloat(lon),
+                    timestamp: Date.now() // Adiciona timestamp para ordenação
+                };
+
+                orders.push(newOrder);
+                originalOrder.push({...newOrder}); // Mantém uma cópia na ordem original
+                localStorage.setItem('orders', JSON.stringify(orders));
+
+                // Adiciona marcador no mapa
+                L.marker([lat, lon]).addTo(map).bindPopup(address);
+                
+                // Centraliza o mapa na nova localização
+                if (currentLocationMarker) {
+                    const bounds = L.latLngBounds(
+                        [currentLocationMarker.getLatLng().lat, currentLocationMarker.getLatLng().lng],
+                        [lat, lon]
+                    );
+                    map.fitBounds(bounds, { padding: [50, 50] });
+                } else {
+                    map.setView([lat, lon], 13);
+                }
+
+                renderOrders();
+                await updateRoute();
+
+            } catch (error) {
+                console.error('Erro ao adicionar pedido:', error);
+                let message = 'Erro ao adicionar endereço.';
+                
+                if (error.name === 'AbortError') {
+                    message = 'Busca demorou muito. Verifique conexão.';
+                } else if (error.message === 'Endereço não encontrado') {
+                    message = 'Endereço não encontrado. Verifique e tente novamente.';
+                }
+                
+                showError(message);
+                throw error;
+            } finally {
+                loadingElement.classList.remove('active');
+            }
+        }
+
+        function removeOrder(index) {
+            try {
+                if (index < 0 || index >= orders.length) return;
+
+                // Remove tanto da lista ordenada quanto da original
+                const removedOrder = orders[index];
+                orders.splice(index, 1);
+                
+                const originalIndex = originalOrder.findIndex(order => 
+                    order.address === removedOrder.address && 
+                    order.lat === removedOrder.lat && 
+                    order.lon === removedOrder.lon
+                );
+                
+                if (originalIndex !== -1) {
+                    originalOrder.splice(originalIndex, 1);
+                }
+
+                localStorage.setItem('orders', JSON.stringify(orders));
+                renderOrders();
+                updateRoute();
+
+                // Limpa e recria os marcadores
+                clearMapMarkers();
+                addMarkersToMap();
+
+            } catch (error) {
+                console.error('Erro ao remover pedido:', error);
+                showError('Erro ao remover pedido.');
+            }
+        }
+
+        function clearMapMarkers() {
+            map.eachLayer((layer) => {
+                if (layer instanceof L.Marker || layer instanceof L.Polyline) {
+                    map.removeLayer(layer);
+                }
+            });
+            
+            // Adiciona o marcador de localização atual novamente
+            if (currentLocationMarker) {
+                map.addLayer(currentLocationMarker);
+            }
+        }
+
+        function addMarkersToMap() {
+            orders.forEach(order => {
+                L.marker([order.lat, order.lon]).addTo(map).bindPopup(order.address);
+            });
+        }
+
+        async function updateRoute() {
+            if (orders.length < 1) {
+                clearMapMarkers();
+                return;
+            }
+
+            try {
+                loadingElement.textContent = 'Atualizando rota...';
+                loadingElement.classList.add('active');
+
+                const sortMethod = sortMethodSelect.value;
+                let ordersToRoute = [];
+
+                // Aplica o método de ordenação selecionado
+                switch(sortMethod) {
+                    case 'optimized':
+                        if (orders.length > 1) {
+                            ordersToRoute = await getOptimizedRoute(orders);
+                        } else {
+                            ordersToRoute = [...orders];
+                        }
+                        break;
+                    case 'original':
+                        ordersToRoute = [...originalOrder];
+                        break;
+                    case 'reverse':
+                        ordersToRoute = [...originalOrder].reverse();
+                        break;
+                    default:
+                        ordersToRoute = [...orders];
+                }
+
+                // Atualiza a lista de pedidos com a ordenação selecionada
+                orders = [...ordersToRoute];
+                renderOrders();
+
+                // Limpa o mapa e adiciona os marcadores
+                clearMapMarkers();
+                addMarkersToMap();
+
+                // Desenha a rota se houver mais de um ponto
+                if (orders.length >= 2 && sortMethod === 'optimized') {
+                    await drawRoute(orders);
+                }
+
+                // Ajusta a visualização do mapa para mostrar todos os pontos
+                if (currentLocationMarker && orders.length > 0) {
+                    const bounds = orders.reduce((acc, order) => {
+                        return acc.extend([order.lat, order.lon]);
+                    }, L.latLngBounds(
+                        [currentLocationMarker.getLatLng().lat, currentLocationMarker.getLatLng().lng],
+                        [currentLocationMarker.getLatLng().lat, currentLocationMarker.getLatLng().lng]
+                    ));
+                    
+                    map.fitBounds(bounds, { padding: [50, 50] });
+                } else if (orders.length > 0) {
+                    const bounds = orders.reduce((acc, order) => {
+                        return acc.extend([order.lat, order.lon]);
+                    }, L.latLngBounds([orders[0].lat, orders[0].lon], [orders[0].lat, orders[0].lon]));
+                    
+                    map.fitBounds(bounds, { padding: [50, 50] });
+                }
+
+            } catch (error) {
+                console.error('Erro ao atualizar rota:', error);
+                showError('Erro ao atualizar rota. Mostrando pontos sem conexão.');
+                
+                // Mesmo em caso de erro, mostra os pontos no mapa
+                clearMapMarkers();
+                addMarkersToMap();
+            } finally {
+                loadingElement.classList.remove('active');
+            }
+        }
+
+        async function getOptimizedRoute(points) {
+            if (points.length < 2) return points;
+
+            try {
+                const coordinates = points.map(point => `${point.lon},${point.lat}`).join(';');
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), OSRM_TIMEOUT);
+
+                const response = await fetch(
+                    `https://router.project-osrm.org/trip/v1/driving/${coordinates}?overview=false&annotations=duration`,
+                    { signal: controller.signal }
+                );
+
+                clearTimeout(timeout);
+
+                if (!response.ok) throw new Error('Erro na requisição OSRM');
+
+                const data = await response.json();
+                if (data.code !== 'Ok') throw new Error('Erro na otimização');
+
+                return data.waypoints.map(waypoint => points[waypoint.waypoint_index]);
+            } catch (error) {
+                console.error('Erro ao otimizar rota:', error);
+                throw error;
+            }
+        }
+
+        async function drawRoute(points) {
+            if (points.length < 2) return;
+
+            try {
+                const coordinates = points.map(point => `${point.lon},${point.lat}`).join(';');
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), OSRM_TIMEOUT);
+
+                const response = await fetch(
+                    `https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson`,
+                    { signal: controller.signal }
+                );
+
+                clearTimeout(timeout);
+
+                if (!response.ok) throw new Error('Erro na requisição OSRM');
+
+                const routeData = await response.json();
+                if (routeData.code === 'Ok' && routeData.routes.length > 0) {
+                    const route = routeData.routes[0];
+                    L.geoJSON(route.geometry, {
+                        style: {
+                            color: '#3388ff',
+                            weight: 5,
+                            opacity: 0.7
+                        }
+                    }).addTo(map);
+                }
+            } catch (error) {
+                console.error('Erro ao desenhar rota:', error);
+                throw error;
+            }
+        }
+
+        // Inicialização
+        document.addEventListener('DOMContentLoaded', async () => {
+            checkLocationPermissions();
+            renderOrders();
+
+            // Adiciona os marcadores iniciais
+            addMarkersToMap();
+
+            loadingElement.textContent = 'Obtendo localização...';
+            loadingElement.classList.add('active');
+
+            try {
+                const location = await getCurrentLocationWithFallback();
+                const marker = showLocationOnMap(location.latitude, location.longitude, location.accuracy, location.source);
+
+                if (isRunningLocally() && location.source === 'GPS') {
+                    locationWarning.style.display = 'none';
+                } else if (location.source !== 'GPS') {
+                    warningMessage.textContent = `Localização via ${location.source}. Precisão pode ser menor.`;
+                    locationWarning.style.display = 'block';
+                    localFileWarning.style.display = 'none';
+                }
+
+                // Ajusta a visualização do mapa para mostrar todos os pontos
+                if (orders.length > 0) {
+                    const bounds = orders.reduce((acc, order) => {
+                        return acc.extend([order.lat, order.lon]);
+                    }, L.latLngBounds([location.latitude, location.longitude], [location.latitude, location.longitude]));
+                    
+                    map.fitBounds(bounds, { padding: [50, 50] });
+                }
+            } catch (error) {
+                console.error('Erro ao obter localização:', error);
+                showError('Falha ao determinar localização. Usando padrão.');
+                showLocationOnMap(-23.5505, -46.6333, 10000, 'Default');
+            } finally {
+                loadingElement.classList.remove('active');
+                if (orders.length >= 2) {
+                    updateRoute();
+                }
+            }
+        });
+
+        // Torna as funções disponíveis globalmente para os event listeners no HTML
+        window.removeOrder = removeOrder;
+    </script>
+</body>
+</html>
